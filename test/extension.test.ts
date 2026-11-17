@@ -888,6 +888,31 @@ describe('popup-only ChatGPT session transfer', () => {
     expect(worker.scriptingExecuteScript).not.toHaveBeenCalled();
   });
 
+  it('reuses an already-signed-in Chrome session without asking for credentials', async () => {
+    const action = { openPopup: vi.fn(async () => undefined) };
+    const { worker, cookies, requests, tab } = fixture(true, action);
+    // The user's existing Chrome tab is already authenticated before CoS asks for a transfer.
+    worker.scriptingExecuteScript.mockImplementation(async () => [{ frameId: 0, result: true }]);
+    const login = { id: 41, windowId: 7, url: 'https://chatgpt.com/auth/login' };
+    worker.updateTab(41, { url: login.url, status: 'loading' }, login);
+    tab.url = 'https://chatgpt.com/';
+    worker.updateTab(41, { url: tab.url, status: 'complete' }, { ...login, url: tab.url });
+    for (let i = 0; i < 30; i++) await new Promise(resolve => setTimeout(resolve, 0));
+
+    // ChatGPT's existing session returns to home; the extension offers transfer, not login.
+    expect(action.openPopup).toHaveBeenCalledExactlyOnceWith({ windowId: 7 });
+    expect(cookies.getAll).not.toHaveBeenCalled();
+    expect((await worker.sendPopup({ type: 'status' })).signInOffer).toEqual({ id, browser: 'brave' });
+
+    // Only the explicit transfer click reads cookies; unrelated cookies are excluded.
+    expect(await worker.sendPopup({ type: 'cos_sign_in_transfer', id })).toEqual({ ok: true, imported: true });
+    expect(cookies.getAll).toHaveBeenCalledWith({ url: 'https://chatgpt.com/', storeId: 'normal' });
+    expect(requests).toHaveLength(1);
+    expect(requests[0].cookies).toHaveLength(1);
+    expect(requests[0].cookies[0].name).toBe('__Secure-next-auth.session-token');
+    expect(requests[0].cookies[0].value).toBe('synthetic-test-session');
+  });
+
   it('offers the transfer button only while ChatGPT confirms a signed-in account in the active tab', async () => {
     const { worker, tab } = fixture();
     // Unknown (the check could not run): no button.
