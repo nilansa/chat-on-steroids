@@ -66,8 +66,15 @@ function browserFixture(url = 'https://auth.openai.com/log-in') {
     show: vi.fn(), showInactive: vi.fn(), focus: vi.fn(), restore: vi.fn(), setTitle: vi.fn(), destroy: vi.fn()
   };
   host.frames.set(windowId, { id: windowId, base, toolbar: { setBounds: vi.fn(), webContents: { isDestroyed: () => true, close: vi.fn() } }, shown: false, overlay: '' });
+  let debuggerAttached = false;
+  const debuggerApi = Object.assign(new EventEmitter(), {
+    isAttached: (): boolean => debuggerAttached,
+    attach: vi.fn(() => { debuggerAttached = true; }),
+    detach: vi.fn(() => { debuggerAttached = false; debuggerApi.emit('detach', {}, 'target_closed'); }),
+    sendCommand: vi.fn(async () => ({}))
+  });
   const contents = Object.assign(new EventEmitter(), { id: 41, isDestroyed: (): boolean => false,
-    debugger: Object.assign(new EventEmitter(), { isAttached: () => false }),
+    debugger: debuggerApi,
     loadURL: vi.fn(async () => {}), setWindowOpenHandler: vi.fn(), focus: vi.fn(), getURL: () => url });
   host.ses = { cookies: {} };
   host.views.set(contents.id, { webContents: contents, setBounds: vi.fn(), setVisible: vi.fn() });
@@ -208,6 +215,41 @@ it('replaces old chunks, flushes and reads them back before loading ChatGPT, wit
     expect(observed).toEqual([true]);
     expect(contents.loadURL).toHaveBeenCalledWith('https://chatgpt.com/');
   } finally { off(); }
+});
+
+it('allows cookie import while only the passive ChatGPT rendering debugger lease is attached', async () => {
+  const { host, contents, api, jar } = cookieFixture();
+  // active-tabs.js attaches and sends only this command for its idle rendering lease.
+  await host.control.debuggerAttach(contents.id, '1.3');
+  await host.control.debuggerSend(contents.id, 'Emulation.setFocusEmulationEnabled', { enabled: true }, undefined);
+  expect(contents.debugger.isAttached()).toBe(true);
+  await host.importSignIn(host.ses, contents, [cookie(0, 'synthetic-new-0')], () => true);
+  expect([...jar.values()].map(cookie => cookie.value)).toEqual(['synthetic-new-0']);
+  expect(api.flushStore).toHaveBeenCalledExactlyOnceWith();
+  expect(contents.loadURL).toHaveBeenCalledExactlyOnceWith('https://chatgpt.com/');
+});
+
+it('reclassifies a passive rendering lease when later browser control starts', async () => {
+  const { host, contents, api } = cookieFixture();
+  await host.control.debuggerAttach(contents.id, '1.3');
+  await host.control.debuggerSend(contents.id, 'Emulation.setFocusEmulationEnabled', { enabled: true }, undefined);
+  await host.importSignIn(host.ses, contents, [cookie(0, 'synthetic-passive-0')], () => true);
+
+  await host.control.debuggerSend(contents.id, 'Page.enable', {}, undefined);
+  api.get.mockClear();
+  await expect(host.importSignIn(host.ses, contents, [cookie(0, 'synthetic-active-0')], () => true)).rejects.toThrow('transfer_busy');
+  expect(api.get).not.toHaveBeenCalled();
+});
+
+it('keeps cookie import blocked while browser-control owns an active CDP attachment', async () => {
+  const { host, contents, api } = cookieFixture();
+  await host.control.debuggerAttach(contents.id, '1.3');
+  await host.control.debuggerSend(contents.id, 'Page.enable', {}, undefined);
+  await expect(host.importSignIn(host.ses, contents, [cookie(0, 'synthetic-new-0')], () => true)).rejects.toThrow('transfer_busy');
+  expect(api.get).not.toHaveBeenCalled();
+  await host.control.debuggerDetach(contents.id);
+  await host.importSignIn(host.ses, contents, [cookie(0, 'synthetic-new-0')], () => true);
+  expect(contents.loadURL).toHaveBeenCalledExactlyOnceWith('https://chatgpt.com/');
 });
 
 it('restores the previous token if writing a chunk fails, and refuses transfers during live work', async () => {
