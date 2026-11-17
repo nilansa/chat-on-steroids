@@ -6,10 +6,12 @@ import type { MacOSPermissionState } from '../../shared/types.js';
 /**
  * macOS Screen Recording and Accessibility grants across updates.
  *
- * macOS keeps these grants per code signature. Releases are ad-hoc signed, so every update is a
- * new app to it: the switch in System Settings stays on, but no longer applies (live 2026-10-15).
- * Remembering that a permission was granted once tells that case apart from one never given,
- * and resetting this app's own entries lets macOS ask again, which is the repair.
+ * macOS keeps these grants against the code requirement, not the bundle identifier alone. Older
+ * ad-hoc releases used the changing executable cdhash as their implicit requirement, so each
+ * update invalidated a prior grant while leaving the switch looking enabled. New packages use a
+ * stable bundle-identifier designated requirement on the outer app. Remembering a prior grant
+ * still lets this repair migrate existing installs: reset the stale cdhash entry and ask macOS
+ * once under the stable requirement.
  */
 
 /** electron-builder's `appId`, the bundle macOS files the grants under. */
