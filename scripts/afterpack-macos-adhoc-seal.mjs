@@ -1,5 +1,6 @@
 /**
- * Gives the packaged macOS app a valid ad-hoc seal, and refuses to ship one that is not valid.
+ * Gives the packaged macOS app a valid ad-hoc seal with a stable designated requirement,
+ * and refuses to ship one that is not valid.
  *
  * ## The bug this exists for
  *
@@ -22,8 +23,12 @@
  * The release policy is deliberately unsigned and unnotarized, and this does not change that.
  * An ad-hoc seal carries no Authority and no TeamIdentifier — `codesign -dvv` still reports
  * `Signature=adhoc`, and Gatekeeper still will not vouch for it. What it adds is the resource
- * envelope the executable's own signature already claims exists. The bundle stops contradicting
- * itself; it does not become trusted. Users still clear quarantine as before.
+ * envelope the executable's own signature already claims exists. The outer app also gets an
+ * explicit designated requirement based on its bundle identifier. macOS TCC keys Accessibility
+ * and Screen Recording grants to that requirement; the old implicit ad-hoc requirement was the
+ * executable cdhash, so every update looked like a new app and invalidated both grants. A stable
+ * identifier requirement lets a user grant once and keep that grant across app updates. It is
+ * not a trust-bearing certificate and does not make Gatekeeper vouch for the app.
  *
  * ## Why it verifies afterwards
  *
@@ -74,11 +79,18 @@ export default async function sealMacOsBundle(context) {
     if (Object.hasOwn(cleanedPlist, key)) throw new Error(`afterPack failed to remove unused Info.plist key ${key}`);
   }
 
-  // Electron nests frameworks and helper apps that each need their own signature. Signing only the outer
-  // bundle would leave the same self-contradiction one level down. Apple discourages --deep for
-  // *distribution* signing, where each nested component wants its own identity and entitlements;
-  // for a uniform ad-hoc seal with no entitlements there is nothing to distinguish.
+  // Electron nests frameworks and helper apps that each need their own signature. Seal every
+  // nested component first; they keep their own bundle identifiers and default ad-hoc requirements.
   run('codesign', ['--force', '--deep', '--sign', '-', app]);
+
+  // TCC otherwise binds an ad-hoc app's Accessibility/Screen Recording grants to its changing
+  // cdhash. Use the app's actual bundle identifier as an explicit, stable designated requirement
+  // on the outer app only. Do not apply this requirement to nested helpers/frameworks: each keeps
+  // its own identity. This remains ad-hoc (no Authority/TeamIdentifier) and therefore untrusted.
+  const bundleId = originalPlist.CFBundleIdentifier;
+  if (typeof bundleId !== 'string' || !bundleId.trim()) throw new Error('afterPack could not read CFBundleIdentifier');
+  run('codesign', ['--force', '--sign', '-', '--identifier', bundleId,
+    '--requirements', `=designated => identifier "${bundleId}"`, app]);
 
   // The check the two broken releases did not have. --strict so a seal that merely exists is not
   // mistaken for a seal that is coherent, and --deep so a nested framework cannot be the one
