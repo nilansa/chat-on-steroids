@@ -176,6 +176,10 @@ export class CosBrowser {
   private quitting = false;
   /** Tabs whose debugger the extension itself detached: Chrome reports no onDetach for those. */
   private readonly detaching = new Set<number>();
+  /** A newly attached debugger is classified by its first CDP command. */
+  private readonly pendingDebuggerLeases = new Set<number>();
+  /** Browser-control leases are active; the Emulation-only rendering lease is passive. */
+  private readonly browserControlDebuggerLeases = new Set<number>();
   private startPromise: Promise<void> | null = null;
   private signIn: SignInPanel | null = null;
   private browserEpoch = 0;
@@ -648,6 +652,8 @@ export class CosBrowser {
     // A page that closes itself (window.close) is a closed tab.
     contents.once('destroyed', () => {
       if (this.signIn?.contents === contents) this.closeSignIn();
+      this.pendingDebuggerLeases.delete(id);
+      this.browserControlDebuggerLeases.delete(id);
       this.views.delete(id);
       this.favicons.delete(id);
       if (!this.stopping) this.model.removeTab(id);
@@ -665,6 +671,8 @@ export class CosBrowser {
       this.toWorker('debugger.onEvent', [{ tabId: id, ...(sessionId ? { sessionId } : {}) }, method, params]);
     });
     contents.debugger.on('detach', (_event, reason) => {
+      this.pendingDebuggerLeases.delete(id);
+      this.browserControlDebuggerLeases.delete(id);
       this.repaintTab(id);
       if (this.detaching.delete(id)) return;
       this.toWorker('debugger.onDetach', [{ tabId: id }, /closed/i.test(reason) ? 'target_closed' : 'canceled_by_user']);
@@ -858,7 +866,12 @@ export class CosBrowser {
     const epoch = this.browserEpoch;
     const check = () => {
       if (!current()) throw new SignInTransferError('transfer_expired');
-      if (this.generating.size || [...this.views.values()].some(view => view.webContents.debugger.isAttached())) {
+      // The companion keeps an idle ChatGPT tab renderable with a passive
+      // Emulation.setFocusEmulationEnabled debugger lease (active-tabs.js).
+      // Browser-control attachments issue Page/Runtime/Network commands and stay
+      // separately tracked until detach. Do not mistake the passive lease for
+      // active automation, but never replace cookies during active work.
+      if (this.generating.size || this.pendingDebuggerLeases.size || this.browserControlDebuggerLeases.size) {
         throw new SignInTransferError('transfer_busy');
       }
     };
@@ -1037,6 +1050,8 @@ export class CosBrowser {
       if (contents.debugger.isAttached()) throw new Error(`Another debugger is already attached to the tab with id: ${tabId}.`);
       this.detaching.delete(tabId);
       contents.debugger.attach(version);
+      this.pendingDebuggerLeases.add(tabId);
+      this.browserControlDebuggerLeases.delete(tabId);
       this.repaintTab(tabId);
     },
 
@@ -1046,11 +1061,18 @@ export class CosBrowser {
       // Cleared by the detach event this causes, or by the next attach if none arrives.
       this.detaching.add(tabId);
       contents.debugger.detach();
+      this.pendingDebuggerLeases.delete(tabId);
+      this.browserControlDebuggerLeases.delete(tabId);
     },
 
     debuggerSend: async (tabId, method, params, sessionId) => {
       const contents = this.contentsOf(tabId);
       if (!contents.debugger.isAttached()) throw new Error(`Debugger is not attached to the tab with id: ${tabId}.`);
+      // The idle companion lease sends this one Emulation command. Any other CDP
+      // command is real browser control, including when it begins after that lease
+      // was already classified as passive.
+      this.pendingDebuggerLeases.delete(tabId);
+      if (method !== 'Emulation.setFocusEmulationEnabled') this.browserControlDebuggerLeases.add(tabId);
       return contents.debugger.sendCommand(method, params, sessionId);
     },
 
